@@ -24,6 +24,7 @@ dependencies:
   flutter:
     sdk: flutter
 
+  flutter_secure_storage:
   dio:
   rxdart:
   flutter_bloc:
