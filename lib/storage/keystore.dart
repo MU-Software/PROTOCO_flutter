@@ -29,6 +29,11 @@ class KVStore {
     this.storage.write(key: key, value: value);
   }
 
+  delete(String key) {
+    this.data.remove(key);
+    this.storage.delete(key: key);
+  }
+
   Future<KVStore> init() async {
     _instance.isInitialized = true;
     _instance.data = await storage.readAll();
