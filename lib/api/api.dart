@@ -1,6 +1,10 @@
-import 'package:dio/dio.dart';
-import 'package:flutter_user_agent/flutter_user_agent.dart';
 import 'dart:convert';
+import 'dart:io';
+
+import 'package:dio/dio.dart';
+import 'package:dio_cookie_manager/dio_cookie_manager.dart';
+import 'package:cookie_jar/cookie_jar.dart';
+import 'package:flutter_user_agent/flutter_user_agent.dart';
 
 import 'package:PROTOCO_flutter/storage/keystore.dart';
 import 'package:PROTOCO_flutter/util/util.dart';
@@ -10,7 +14,7 @@ class Api {
   static final Api _instance = Api._internal();
 
   Dio api;
-  KVStore kvstore;
+  CookieManager cookieManager;
 
   // Singleton
   factory Api() {
@@ -21,6 +25,7 @@ class Api {
   Api._internal() {
     api = Dio();
 
+    api.interceptors.add(cookieManager);
     api.interceptors.add(
       InterceptorsWrapper(onRequest: (RequestOptions options) async {
         var customHeaders = {
@@ -30,10 +35,8 @@ class Api {
         };
         options.headers.addAll(customHeaders);
         options.validateStatus = (code) {
-          // if (code < 500) {
+          // Make all response success as we send custom error codes
           return true;
-          // }
-          // return false;
         };
 
         // TODO: Set proper api version on production
@@ -41,6 +44,168 @@ class Api {
 
         return options;
       }),
+    );
+  }
+
+  Future<bool> checkTokenStatus() async {
+    KVStore kvStore = KVStore();
+    if (kvStore.data['refreshToken'] == null || kvStore.data['refreshToken'].isEmpty) {
+      return false;
+    }
+
+    // Try to parse access token cookie string
+    if (kvStore.data['accessToken'] != null && kvStore.data['accessToken'].isNotEmpty) {
+      try {
+        Cookie accessTokenCookie = Cookie.fromSetCookieValue(kvStore.data['accessToken'] ?? '');
+        if (accessTokenCookie.expires.toUtc().isAfter(DateTime.now().toUtc())) {
+          // Only set isAccessTokenExpired to false when accessToken is not expired
+          return true;
+        }
+      } catch (e) {}
+    }
+
+    // Make access token alive again
+    try {
+      ApiResult apiResult = ApiResult.fromResponse(await this.api.post('/account/refresh'));
+      for (String setcookie in apiResult.header['set-cookie']) {
+        try {
+          Cookie c = Cookie.fromSetCookieValue(setcookie);
+          if (c.name == 'accessToken') {
+            kvStore['accessToken'] = setcookie;
+            return true;
+          } else if (c.name == 'refreshToken') {
+            kvStore['refreshToken'] = setcookie;
+          }
+        } catch (e) {}
+      }
+      // Refreshing accessToken failed
+      return false;
+    } catch (e) {}
+    return false;
+  }
+
+  requestErrorHandler(DioError e) {
+    switch (e.type) {
+      case DioErrorType.RESPONSE:
+        throw ExcMsg(
+          '서버가 알 수 없는 대답을 보냈어요.',
+          debugMessage: '서버가 응답했으나 오류로 처리되었습니다.',
+        );
+      case DioErrorType.CANCEL:
+        throw ExcMsg(
+          '요청을 중단했어요.',
+          debugMessage: '유저가 요청을 중단했습니다.',
+        );
+      case DioErrorType.CONNECT_TIMEOUT:
+        throw ExcMsg('서버와 통신을 할 수 없어요.');
+      case DioErrorType.RECEIVE_TIMEOUT:
+        throw ExcMsg('서버에서 답을 주지 않아요.');
+      case DioErrorType.SEND_TIMEOUT:
+        throw ExcMsg('서버에 정보를 전달할 수 없어요.');
+      case DioErrorType.DEFAULT:
+        throw ExcMsg('통신중에 문제가 발생했어요.');
+    }
+  }
+
+  Future<ApiResult> safeRequest(Future<Response> reqFunc(), String path, {bool needToken: false}) async {
+    try {
+      KVStore kvStore = KVStore();
+      List<Cookie> authCookies = List<Cookie>();
+      if (cookieManager != null) {
+        api.interceptors.remove(cookieManager);
+        cookieManager = null;
+      }
+
+      if (needToken) {
+        if (!await this.checkTokenStatus()) throw ExcMsg('로그인이 필요해요, 로그인 후 다시 시도해주세요!');
+
+        authCookies.add(Cookie('accessToken', kvStore.data['accessToken']));
+        if (path.startsWith('/account/')) authCookies.add(Cookie('refreshToken', kvStore.data['refreshToken']));
+      }
+
+      if (authCookies.isNotEmpty) {
+        CookieJar newCookieJar = CookieJar();
+        newCookieJar.saveFromResponse(Uri.parse('https://protoco.cc/'), authCookies);
+        cookieManager = CookieManager(newCookieJar);
+        api.interceptors.add(cookieManager);
+      }
+
+      Response response = await reqFunc();
+      return ApiResult.fromResponse(response);
+    } on DioError catch (e) {
+      this.requestErrorHandler(e);
+    } on ExcMsg catch (e) {
+      throw e;
+    } catch (e, stacktrace) {
+      throw ExcMsg(
+        '서버와의 통신 중에 문제가 발생했어요.',
+        debugMessage: e.toString() + stacktrace.toString(),
+      );
+    }
+    throw ExcMsg(
+      '서버와의 통신 중에 문제가 발생했어요, 다시 시도해주세요.',
+      debugMessage: '어떠한 경우에도 해당하지 않는 상황입니다.',
+    );
+  }
+
+  Future<ApiResult> get(String path,
+      {bool needToken: false, Map<String, dynamic> queryParameters, Options options}) async {
+    return this.safeRequest(
+      () => this.api.get(
+            path,
+            queryParameters: queryParameters,
+            options: options,
+          ),
+      path,
+      needToken: needToken,
+    );
+  }
+
+  Future<ApiResult> post(String path, {bool needToken: false, dynamic data, Options options}) async {
+    return this.safeRequest(
+      () => this.api.post(
+            path,
+            data: data,
+            options: options,
+          ),
+      path,
+      needToken: needToken,
+    );
+  }
+
+  Future<ApiResult> patch(String path, {bool needToken: false, dynamic data, Options options}) async {
+    return this.safeRequest(
+      () => this.api.post(
+            path,
+            data: data,
+            options: options,
+          ),
+      path,
+      needToken: needToken,
+    );
+  }
+
+  Future<ApiResult> put(String path, {bool needToken: false, dynamic data, Options options}) async {
+    return this.safeRequest(
+      () => this.api.post(
+            path,
+            data: data,
+            options: options,
+          ),
+      path,
+      needToken: needToken,
+    );
+  }
+
+  Future<ApiResult> delete(String path, {bool needToken: false, dynamic data, Options options}) async {
+    return this.safeRequest(
+      () => this.api.post(
+            path,
+            data: data,
+            options: options,
+          ),
+      path,
+      needToken: needToken,
     );
   }
 }
@@ -56,14 +221,23 @@ class ApiResult {
 
   ApiResult.fromResponse(Response response) {
     if (response == null) {
-      throw Exception('응답이 없습니다');
+      throw ExcMsg(
+        '서버가 응답이 없어요.',
+        debugMessage: 'response 객체가 null입니다.',
+      );
+    } else if (response.statusCode > 500) {
+      throw ExcMsg(
+        '서버와 통신에 실패했어요.',
+        debugMessage: 'statusCode가 ${response.statusCode.toString()}입니다.',
+      );
     }
-    if (response.statusCode > 500) {
-      throw Exception('서버와 통신에 실패했어요.');
-    }
+
     dynamic responseJson = json.decode(response.data);
     if (responseJson == null) {
-      throw Exception('서버에서 받은 응답을 이해하지 못했어요.');
+      throw ExcMsg(
+        '서버에서 받은 응답을 이해하지 못했어요.',
+        debugMessage: '서버에서 받은 데이터를 파싱하지 못했습니다.',
+      );
     }
 
     this.header = response.headers.map;
