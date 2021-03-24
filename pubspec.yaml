@@ -26,6 +26,10 @@ dependencies:
 
   flutter_secure_storage:
   dio:
+  dio_cookie_manager:
+  cookie_jar:
+  flutter_user_agent:
+
   rxdart:
   flutter_bloc:
   firebase_messaging:
