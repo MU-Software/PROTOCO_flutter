@@ -24,6 +24,7 @@ class Api {
   // Initializer
   Api._internal() {
     api = Dio();
+    cookieManager = CookieManager(CookieJar());
 
     api.interceptors.add(cookieManager);
     api.interceptors.add(
@@ -49,14 +50,14 @@ class Api {
 
   Future<bool> checkTokenStatus() async {
     KVStore kvStore = KVStore();
-    if (kvStore.data['refreshToken'] == null || kvStore.data['refreshToken'].isEmpty) {
+    if (kvStore.data['refresh_token'] == null || kvStore.data['refresh_token'].isEmpty) {
       return false;
     }
 
     // Try to parse access token cookie string
-    if (kvStore.data['accessToken'] != null && kvStore.data['accessToken'].isNotEmpty) {
+    if (kvStore.data['access_token'] != null && kvStore.data['access_token'].isNotEmpty) {
       try {
-        Cookie accessTokenCookie = Cookie.fromSetCookieValue(kvStore.data['accessToken'] ?? '');
+        Cookie accessTokenCookie = Cookie.fromSetCookieValue(kvStore.data['access_token'] ?? '');
         if (accessTokenCookie.expires.toUtc().isAfter(DateTime.now().toUtc())) {
           // Only set isAccessTokenExpired to false when accessToken is not expired
           return true;
@@ -66,15 +67,22 @@ class Api {
 
     // Make access token alive again
     try {
-      ApiResult apiResult = ApiResult.fromResponse(await this.api.post('/account/refresh'));
+      ApiResult apiResult = ApiResult.fromResponse(
+        await this.api.post(
+              '/account/refresh',
+              options: Options(
+                headers: {'Cookie': kvStore.data['refresh_token']},
+              ),
+            ),
+      );
       for (String setcookie in apiResult.header['set-cookie']) {
         try {
           Cookie c = Cookie.fromSetCookieValue(setcookie);
-          if (c.name == 'accessToken') {
-            kvStore['accessToken'] = setcookie;
+          if (c.name == 'access_token') {
+            kvStore['access_token'] = setcookie;
             return true;
-          } else if (c.name == 'refreshToken') {
-            kvStore['refreshToken'] = setcookie;
+          } else if (c.name == 'refresh_token') {
+            kvStore['refresh_token'] = setcookie;
           }
         } catch (e) {}
       }
@@ -84,27 +92,41 @@ class Api {
     return false;
   }
 
-  requestErrorHandler(DioError e) {
+  ExcMsg requestErrorHandler(DioError e, StackTrace stackTrace) {
+    String clientMessage, debugMessage;
     switch (e.type) {
       case DioErrorType.RESPONSE:
-        throw ExcMsg(
-          '서버가 알 수 없는 대답을 보냈어요.',
-          debugMessage: '서버가 응답했으나 오류로 처리되었습니다.',
-        );
+        clientMessage = '서버가 알 수 없는 대답을 했어요.\n나중에 다시 시도해주세요.';
+        debugMessage = '서버가 응답했으나 오류로 처리되었습니다.';
+        break;
       case DioErrorType.CANCEL:
-        throw ExcMsg(
-          '요청을 중단했어요.',
-          debugMessage: '유저가 요청을 중단했습니다.',
-        );
+        clientMessage = '요청을 중단했어요.\n다시 시도해주세요.';
+        debugMessage = '유저가 요청을 중단했습니다.';
+        break;
       case DioErrorType.CONNECT_TIMEOUT:
-        throw ExcMsg('서버와 통신을 할 수 없어요.');
+        clientMessage = '서버와 통신을 할 수 없어요.\n인터넷 연결을 확인해주세요.';
+        debugMessage = 'CONNECT_TIMEOUT 입니다.';
+        break;
       case DioErrorType.RECEIVE_TIMEOUT:
-        throw ExcMsg('서버에서 답을 주지 않아요.');
+        clientMessage = '서버의 대답을 기다렸지만 오지 않았어요.\n나중에 다시 시도해주세요.';
+        debugMessage = 'RECEIVE_TIMEOUT 입니다.';
+        break;
       case DioErrorType.SEND_TIMEOUT:
-        throw ExcMsg('서버에 정보를 전달할 수 없어요.');
+        clientMessage = '서버에 정보를 전달할 수 없어요.\n인터넷 연결을 확인해주세요.';
+        debugMessage = 'SEND_TIMEOUT 입니다.';
+        break;
       case DioErrorType.DEFAULT:
-        throw ExcMsg('통신중에 문제가 발생했어요.');
+      default:
+        clientMessage = '서버와 통신중에 문제가 생겼어요.\n나중에 다시 시도해주세요.';
+        debugMessage = 'DioErrorType.DEFAULT 또는 defaule 입니다.';
+        break;
     }
+    return ExcMsg(
+      clientMessage,
+      debugMessage: debugMessage,
+      exception: e,
+      stackTrace: stackTrace,
+    );
   }
 
   Future<ApiResult> safeRequest(Future<Response> reqFunc(), String path, {bool needToken: false}) async {
@@ -113,14 +135,15 @@ class Api {
       List<Cookie> authCookies = List<Cookie>();
       if (cookieManager != null) {
         api.interceptors.remove(cookieManager);
+        api.interceptors.removeWhere((item) => item == null);
         cookieManager = null;
       }
 
       if (needToken) {
         if (!await this.checkTokenStatus()) throw ExcMsg('로그인이 필요해요, 로그인 후 다시 시도해주세요!');
 
-        authCookies.add(Cookie('accessToken', kvStore.data['accessToken']));
-        if (path.startsWith('/account/')) authCookies.add(Cookie('refreshToken', kvStore.data['refreshToken']));
+        authCookies.add(Cookie('access_token', kvStore.data['access_token']));
+        if (path.startsWith('/account/')) authCookies.add(Cookie('refresh_token', kvStore.data['refresh_token']));
       }
 
       if (authCookies.isNotEmpty) {
@@ -132,20 +155,18 @@ class Api {
 
       Response response = await reqFunc();
       return ApiResult.fromResponse(response);
-    } on DioError catch (e) {
-      this.requestErrorHandler(e);
+    } on DioError catch (e, stacktrace) {
+      throw this.requestErrorHandler(e, stacktrace);
     } on ExcMsg catch (e) {
       throw e;
-    } catch (e, stacktrace) {
+    } catch (e, stackTrace) {
       throw ExcMsg(
         '서버와의 통신 중에 문제가 발생했어요.',
-        debugMessage: e.toString() + stacktrace.toString(),
+        debugMessage: '알 수 없는 예외가 발생했습니다.',
+        exception: e,
+        stackTrace: stackTrace,
       );
     }
-    throw ExcMsg(
-      '서버와의 통신 중에 문제가 발생했어요, 다시 시도해주세요.',
-      debugMessage: '어떠한 경우에도 해당하지 않는 상황입니다.',
-    );
   }
 
   Future<ApiResult> get(String path,
@@ -232,7 +253,7 @@ class ApiResult {
       );
     }
 
-    dynamic responseJson = json.decode(response.data);
+    dynamic responseJson = response.data;
     if (responseJson == null) {
       throw ExcMsg(
         '서버에서 받은 응답을 이해하지 못했어요.',
