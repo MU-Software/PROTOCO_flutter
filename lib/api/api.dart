@@ -48,21 +48,24 @@ class Api {
     );
   }
 
-  Future<bool> checkTokenStatus() async {
+  Future<bool> checkTokenStatus({bool forceTokenRefresh = false}) async {
     KVStore kvStore = KVStore();
     if (kvStore.data['refresh_token'] == null || kvStore.data['refresh_token'].isEmpty) {
       return false;
     }
 
-    // Try to parse access token cookie string
-    if (kvStore.data['access_token'] != null && kvStore.data['access_token'].isNotEmpty) {
-      try {
-        Cookie accessTokenCookie = Cookie.fromSetCookieValue(kvStore.data['access_token'] ?? '');
-        if (accessTokenCookie.expires.toUtc().isAfter(DateTime.now().toUtc())) {
-          // Only set isAccessTokenExpired to false when accessToken is not expired
-          return true;
-        }
-      } catch (e) {}
+    if (!forceTokenRefresh) {
+      // Try to parse access token cookie string only when forceTokenRefresh is false
+      // This means when forceTokenRefresh is true, then there will be request on /account/refresh everytime
+      if (kvStore.data['access_token'] != null && kvStore.data['access_token'].isNotEmpty) {
+        try {
+          Cookie accessTokenCookie = Cookie.fromSetCookieValue(kvStore.data['access_token'] ?? '');
+          if (accessTokenCookie.expires.toUtc().isAfter(DateTime.now().toUtc())) {
+            // Only set isAccessTokenExpired to false when accessToken is not expired
+            return true;
+          }
+        } catch (e) {}
+      }
     }
 
     // Make access token alive again
@@ -75,28 +78,36 @@ class Api {
               ),
             ),
       );
-      for (String setcookie in apiResult.header['set-cookie']) {
-        try {
-          Cookie c = Cookie.fromSetCookieValue(setcookie);
-          if (c.name == 'access_token') {
-            kvStore['access_token'] = setcookie;
-            return true;
-          } else if (c.name == 'refresh_token') {
-            kvStore['refresh_token'] = setcookie;
-          }
-        } catch (e) {}
+      if (apiResult.success) {
+        for (String setcookie in apiResult.header['set-cookie']) {
+          try {
+            Cookie c = Cookie.fromSetCookieValue(setcookie);
+            if (c.name == 'access_token') {
+              kvStore['access_token'] = setcookie;
+              return true;
+            } else if (c.name == 'refresh_token') {
+              kvStore['refresh_token'] = setcookie;
+            }
+          } catch (e) {}
+        }
+        // Refreshing accessToken failed
+        return false;
       }
-      // Refreshing accessToken failed
-      return false;
     } catch (e) {}
     return false;
   }
 
   ExcMsg requestErrorHandler(DioError e, StackTrace stackTrace) {
     String clientMessage, debugMessage;
+
+    ApiResult apiResult;
+    if (e.response != null) {
+      apiResult = ApiResult.fromResponse(e.response);
+      // If ApiResult.fromResponse didn't throw Exception, then we can get subCode from response.
+    }
     switch (e.type) {
       case DioErrorType.RESPONSE:
-        clientMessage = '서버가 알 수 없는 대답을 했어요.\n나중에 다시 시도해주세요.';
+        clientMessage = '서버가 알 수 없는 대답을 보냈어요.\n잠시 후에 다시 시도해주세요.';
         debugMessage = '서버가 응답했으나 오류로 처리되었습니다.';
         break;
       case DioErrorType.CANCEL:
@@ -108,7 +119,7 @@ class Api {
         debugMessage = 'CONNECT_TIMEOUT 입니다.';
         break;
       case DioErrorType.RECEIVE_TIMEOUT:
-        clientMessage = '서버의 대답을 기다렸지만 오지 않았어요.\n나중에 다시 시도해주세요.';
+        clientMessage = '서버의 대답을 기다렸지만 오지 않았어요.\n잠시 후에 다시 시도해주세요.';
         debugMessage = 'RECEIVE_TIMEOUT 입니다.';
         break;
       case DioErrorType.SEND_TIMEOUT:
@@ -116,9 +127,17 @@ class Api {
         debugMessage = 'SEND_TIMEOUT 입니다.';
         break;
       case DioErrorType.DEFAULT:
+        clientMessage = '서버와 통신중에 문제가 생겼어요.\n잠시 후에 다시 시도해주세요.';
+        if (apiResult != null) {
+          if (apiResult.message != null && apiResult.message.isEmpty) clientMessage = apiResult.message;
+          debugMessage = 'Response의 subCode는 ${apiResult.subCode}입니다.';
+        } else {
+          debugMessage = 'DioErrorType.DEFAULT 입니다.';
+        }
+        break;
       default:
-        clientMessage = '서버와 통신중에 문제가 생겼어요.\n나중에 다시 시도해주세요.';
-        debugMessage = 'DioErrorType.DEFAULT 또는 defaule 입니다.';
+        clientMessage = '서버와 통신중에 문제가 생겼어요.\n잠시 후에 다시 시도해주세요.';
+        debugMessage = 'DioErrorType case에서 match되는 것이 없이 default 입니다.';
         break;
     }
     return ExcMsg(
@@ -140,7 +159,7 @@ class Api {
       }
 
       if (needToken) {
-        if (!await this.checkTokenStatus()) throw ExcMsg('로그인이 필요해요, 로그인 후 다시 시도해주세요!');
+        if (!await this.checkTokenStatus()) throw ExcMsg('로그인이 필요해요,\n로그인 후 다시 시도해주세요!');
 
         authCookies.add(Cookie('access_token', kvStore.data['access_token']));
         if (path.startsWith('/account/')) authCookies.add(Cookie('refresh_token', kvStore.data['refresh_token']));
@@ -240,15 +259,18 @@ class ApiResult {
   String message;
   Map<String, dynamic> data;
 
-  ApiResult.fromResponse(Response response) {
+  ApiResult({this.success, this.code, this.subCode, this.message, this.data});
+
+  factory ApiResult.fromResponse(Response response, {bool isRetry: false}) {
+    ApiResult _this = ApiResult();
     if (response == null) {
       throw ExcMsg(
-        '서버가 응답이 없어요.',
+        '서버가 응답이 없어요,\n잠시 후에 다시 시도해주세요.',
         debugMessage: 'response 객체가 null입니다.',
       );
     } else if (response.statusCode > 500) {
       throw ExcMsg(
-        '서버와 통신에 실패했어요.',
+        '서버와 통신에 실패했어요,\n잠시 후에 다시 시도해주세요.',
         debugMessage: 'statusCode가 ${response.statusCode.toString()}입니다.',
       );
     }
@@ -256,35 +278,58 @@ class ApiResult {
     dynamic responseJson = response.data;
     if (responseJson == null) {
       throw ExcMsg(
-        '서버에서 받은 응답을 이해하지 못했어요.',
+        '서버에서 받은 응답을 이해하지 못했어요,\n잠시 후에 다시 시도해주세요.',
         debugMessage: '서버에서 받은 데이터를 파싱하지 못했습니다.',
       );
     }
 
-    this.header = response.headers.map;
-    this.success = response.data['success'];
-    this.code = response.data['code'];
-    this.subCode = response.data['sub_code'];
-    this.message = response.data['message'];
-    this.data = response.data['data'];
+    _this.header = response.headers.map;
+    _this.success = response.data['success'];
+    _this.code = response.data['code'];
+    _this.subCode = response.data['sub_code'];
+    _this.message = response.data['message'];
+    _this.data = response.data['data'];
 
-    if (this.subCode.startsWith('request.body')) {
-      throw ExcMsg(
-        '알 수 없는 문제가 발생했어요.',
-        debugMessage: '클라이언트가 요청할 데이터를 제대로 보내지 않았어요.',
-      );
-    } else if (this.subCode.startsWith('request.header')) {
-      throw ExcMsg(
-        '알 수 없는 문제가 발생했어요.',
-        debugMessage: '클라이언트가 요청의 말머리를 제대로 보내지 않았어요.',
-      );
-    } else if (this.subCode.startsWith('backend')) {
-      throw ExcMsg(
-        '서버에 알 수 없는 문제가 발생했어요.',
-        debugMessage: '서버가 영 좋지 않은 상황이에요.',
-      );
-    } else if (this.subCode.startsWith('http')) {
-      throw ExcMsg('서버에서 무엇을 할지 모르는 요청이에요...');
+    if (!_this.success) {
+      if (_this.subCode.startsWith('request.body')) {
+        throw ExcMsg(
+          '알 수 없는 문제가 발생했어요,\n잠시 후에 다시 시도해주세요.',
+          debugMessage: '클라이언트가 요청할 데이터를 제대로 보내지 않았어요.',
+        );
+      } else if (_this.subCode.startsWith('request.header')) {
+        throw ExcMsg(
+          '알 수 없는 문제가 발생했어요,\n잠시 후에 다시 시도해주세요.',
+          debugMessage: '클라이언트가 요청의 말머리를 제대로 보내지 않았어요.',
+        );
+      } else if (_this.subCode.startsWith('backend')) {
+        throw ExcMsg(
+          '서버에 알 수 없는 문제가 발생했어요,\n잠시 후에 다시 시도해주세요.',
+          debugMessage: '서버가 영 좋지 않은 상황이에요.',
+        );
+      } else if (_this.subCode.startsWith('http')) {
+        throw ExcMsg('서버에서 무엇을 할지 모르는 요청이에요...');
+      } else if (_this.subCode.startsWith('refresh_token')) {
+        KVStore()['refresh_token'] = null;
+        KVStore()['access_token'] = null;
+        throw ExcMsg(
+          '로그인 정보가 올바르지 않아요,\n죄송하지만 다시 로그인 해주세요.',
+          debugMessage: '서버가 ${_this.subCode}를 반환했습니다.',
+        );
+      } else if (_this.subCode.startsWith('access_token')) {
+        // Maybe access token's time is not expired, but it's revoked?
+        // We need to retry this request after force token refresh.
+        if (!isRetry) {
+          return ApiResult.fromResponse(response, isRetry: true);
+        } else {
+          KVStore()['refresh_token'] = null;
+          KVStore()['access_token'] = null;
+          throw ExcMsg(
+            '로그인 정보가 올바르지 않아요,\n죄송하지만 다시 로그인 해주세요.',
+            debugMessage: 'AccessToken이 올바르지 않고, 서버가 ${_this.subCode}를 반환했습니다.',
+          );
+        }
+      }
     }
+    return ApiResult.fromResponse(response);
   }
 }
