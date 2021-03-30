@@ -115,7 +115,7 @@ class Api {
         debugMessage = '유저가 요청을 중단했습니다.';
         break;
       case DioErrorType.CONNECT_TIMEOUT:
-        clientMessage = '서버와 통신을 할 수 없어요.\n인터넷 연결을 확인해주세요.';
+        clientMessage = '서버와 연결하기위해 기다렸지만 연결을 맺지 못했어요.\n잠시 후에 다시 시도해주세요.';
         debugMessage = 'CONNECT_TIMEOUT 입니다.';
         break;
       case DioErrorType.RECEIVE_TIMEOUT:
@@ -127,7 +127,7 @@ class Api {
         debugMessage = 'SEND_TIMEOUT 입니다.';
         break;
       case DioErrorType.DEFAULT:
-        clientMessage = '서버와 통신중에 문제가 생겼어요.\n잠시 후에 다시 시도해주세요.';
+        clientMessage = '서버와 통신을 할 수 없어요.\n인터넷 연결을 확인해주세요.';
         if (apiResult != null) {
           if (apiResult.message != null && apiResult.message.isEmpty) clientMessage = apiResult.message;
           debugMessage = 'Response의 subCode는 ${apiResult.subCode}입니다.';
@@ -178,11 +178,17 @@ class Api {
       throw this.requestErrorHandler(e, stacktrace);
     } on ExcMsg catch (e) {
       throw e;
+    } on Exception catch (e, stackTrace) {
+      throw ExcMsg(
+        '서버와의 통신 중에 문제가 발생했어요.\n잠시 후 다시 시도해주세요.',
+        debugMessage: '알 수 없는 예외가 발생했습니다.(exception object is subclass of Exception)',
+        exception: e,
+        stackTrace: stackTrace,
+      );
     } catch (e, stackTrace) {
       throw ExcMsg(
-        '서버와의 통신 중에 문제가 발생했어요.',
-        debugMessage: '알 수 없는 예외가 발생했습니다.',
-        exception: e,
+        '서버와의 통신 중에 문제가 발생했어요.\n잠시 후 다시 시도해주세요.',
+        debugMessage: '알 수 없는 예외가 발생했습니다.(exception(${e.runtimeType.toString()}) is not a subclass of Exception)',
         stackTrace: stackTrace,
       );
     }
@@ -283,12 +289,20 @@ class ApiResult {
       );
     }
 
-    _this.header = response.headers.map;
-    _this.success = response.data['success'];
-    _this.code = response.data['code'];
-    _this.subCode = response.data['sub_code'];
-    _this.message = response.data['message'];
-    _this.data = response.data['data'];
+    _this.header = response?.headers?.map ?? Map<String, dynamic>();
+    if (response.data.runtimeType == Map) {
+      _this.success = (response.data['success'] ?? '') == 'true';
+      _this.code = int.tryParse(response.data['code'] ?? '');
+      _this.subCode = response.data['sub_code'] ?? '';
+      _this.message = response.data['message'] ?? '';
+      _this.data = response.data['data'] ?? '';
+    } else {
+      _this.success = false;
+      _this.code = -1;
+      _this.subCode = '';
+      _this.message = '';
+      _this.data = Map<String, dynamic>();
+    }
 
     if (!_this.success) {
       if (_this.subCode.startsWith('request.body')) {
@@ -328,8 +342,13 @@ class ApiResult {
             debugMessage: 'AccessToken이 올바르지 않고, 서버가 ${_this.subCode}를 반환했습니다.',
           );
         }
+      } else {
+        throw ExcMsg(
+          '서버와의 통신에서 문제가 발생했어요,\n잠시 후 다시 시도해주세요.',
+          debugMessage: '서버가 "${_this.subCode.isEmpty ? "sub_code 없음" : _this.subCode}"를 반환했습니다.',
+        );
       }
     }
-    return ApiResult.fromResponse(response);
+    return _this;
   }
 }
